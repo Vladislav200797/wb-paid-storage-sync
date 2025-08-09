@@ -18,8 +18,11 @@ jobs:
       - name: Install deps
         run: pip install requests supabase==2.6.0
       - name: Daily sync (last 8 days)
-        env:
-          WB_API_TOKEN: ${{ secrets.WB_API_TOKEN }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: python wb_paid_storage_sync.py sync 8
+  timeout-minutes: 40
+  env:
+    PYTHONUNBUFFERED: "1"
+    WB_API_TOKEN: ${{ secrets.WB_API_TOKEN }}
+    SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+    SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+  run: python wb_paid_storage_sync.py sync 8
+
