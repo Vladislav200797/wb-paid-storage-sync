@@ -15,9 +15,6 @@ def _auth_header(bearer: bool = True):
         "Accept": "application/json",
     }
 
-
-HEADERS = { "Authorization": f"Bearer {WB_TOKEN}", "Accept": "application/json" }
-
 MAX_DAYS = 8
 POLL_EVERY_SECONDS = 10
 TIMEOUT_SECONDS = 1800
@@ -214,5 +211,6 @@ if __name__ == "__main__":
     else:
         print("Unknown mode")
         sys.exit(1)
+
 
 
