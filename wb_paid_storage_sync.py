@@ -12,8 +12,8 @@ SB_KEY    = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 HEADERS = { "Authorization": f"Bearer {WB_TOKEN}", "Accept": "application/json" }
 
 MAX_DAYS = 8
-POLL_EVERY_SECONDS = 5
-TIMEOUT_SECONDS = 180
+POLL_EVERY_SECONDS = 10
+TIMEOUT_SECONDS = 1800
 
 # === Вспомогательные ===
 def supa():
@@ -34,17 +34,37 @@ def create_task(d_from: dt.date, d_to: dt.date) -> str:
 
 def task_status(task_id: str) -> str:
     url = f"{WB_BASE}/api/v1/paid_storage/tasks/{task_id}/status"
-    r = requests.get(url, headers=HEADERS, timeout=60)
-    r.raise_for_status()
-    return r.json()["data"]["status"]
+    delay = 5
+    for attempt in range(10):
+        r = requests.get(url, headers=_auth_header(True), timeout=60)
+        if r.status_code == 401:
+            r = requests.get(url, headers=_auth_header(False), timeout=60)
+        if r.status_code == 429 or 500 <= r.status_code < 600:
+            # перегрузка/спайк — подождём и попробуем снова
+            time.sleep(delay)
+            delay = min(delay + 5, 30)
+            continue
+        r.raise_for_status()
+        return r.json()["data"]["status"]
+    # если 10 попыток так и не прочитали статус — считаем ошибкой
+    raise RuntimeError("WB status polling failed after retries")
 
 def wait_done(task_id: str):
     start = time.time()
+    last_print = 0
     while True:
         s = task_status(task_id)
-        if s == "done": return
-        if s in ("error","failed"): raise RuntimeError(f"Task {task_id} failed: {s}")
-        if time.time() - start > TIMEOUT_SECONDS: raise TimeoutError(f"Task {task_id} timeout")
+        now = time.time()
+        if s == "done":
+            return
+        if s in ("error", "failed"):
+            raise RuntimeError(f"Task {task_id} failed: {s}")
+        if now - start > TIMEOUT_SECONDS:
+            raise TimeoutError(f"Task {task_id} timeout (> {TIMEOUT_SECONDS}s)")
+        # раз в минуту печатаем «живой» пульс
+        if now - last_print > 60:
+            print(f"waiting WB task {task_id}, status={s}, elapsed={int(now-start)}s")
+            last_print = now
         time.sleep(POLL_EVERY_SECONDS)
 
 def download_report(task_id: str) -> List[Dict[str, Any]]:
@@ -187,3 +207,4 @@ if __name__ == "__main__":
     else:
         print("Unknown mode")
         sys.exit(1)
+
