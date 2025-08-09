@@ -1,277 +1,210 @@
-#!/usr/bin/env python3
-import os
-import sys
-import time
-import math
-import json
-import datetime as dt
-from typing import List, Dict, Any, Iterable
-
+import os, sys, time, json, hashlib, datetime as dt
+from typing import List, Dict, Any
 import requests
-from supabase import create_client, Client
+from supabase import create_client
 
-# === Конфиг через переменные окружения ===
 WB_BASE   = os.getenv("WB_API_BASE", "https://seller-analytics-api.wildberries.ru")
 WB_TOKEN  = os.environ["WB_API_TOKEN"]
 SB_URL    = os.environ["SUPABASE_URL"]
 SB_KEY    = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-TABLE     = os.getenv("WB_TABLE", "wb_paid_storage")
 
-# Ограничения WB: отчёт максимум за 8 дней (включительно)
-WB_MAX_WINDOW_DAYS = 8
+# по умолчанию — Bearer, как в твоём «быстром» варианте
+HEADERS = { "Authorization": f"Bearer {WB_TOKEN}", "Accept": "application/json" }
 
-# Глобальный фолбэк по виду заголовка Authorization:
-# сначала пробуем без Bearer (как у тебя в PowerShell), если получаем 401 — переключаемся на Bearer
-_AUTH_STYLE = None  # None | "plain" | "bearer"
+MAX_DAYS = 8
+POLL_EVERY_SECONDS = 10
+TIMEOUT_SECONDS = 1800
 
-
-# === Вспомогалки ===
-def chunks_8days(d_from: dt.date, d_to: dt.date) -> Iterable[tuple[dt.date, dt.date]]:
-    """Режем произвольный интервал на окна по ≤8 дней включительно (формат WB)."""
-    cur = d_from
-    one_day = dt.timedelta(days=1)
-    while cur <= d_to:
-        end = min(cur + dt.timedelta(days=WB_MAX_WINDOW_DAYS - 1), d_to)
-        yield cur, end
-        cur = end + one_day
-
-
-def _headers(auth_style: str) -> Dict[str, str]:
-    if auth_style == "bearer":
-        return {"Authorization": f"Bearer {WB_TOKEN}"}
-    return {"Authorization": WB_TOKEN}
-
-
-def _get(url: str, params: Dict[str, Any] | None = None, timeout: int = 60) -> requests.Response:
-    """GET с автоподбором стиля Authorization (plain→bearer при 401)."""
-    global _AUTH_STYLE
-    tried = []
-
-    styles = [_AUTH_STYLE] if _AUTH_STYLE else ["plain", "bearer"]
-    # plain сначала, потому что именно так у тебя работал PowerShell
-    if styles == ["bearer"]:
-        styles = ["bearer", "plain"]  # если уже зафиксирован bearer — пробуем его первым
-
-    for style in styles:
-        tried.append(style)
-        r = requests.get(url, headers=_headers(style), params=params, timeout=timeout)
-        if r.status_code == 401 and _AUTH_STYLE is None:
-            # переключимся и попробуем второй стиль
-            continue
-        # запомним рабочий стиль
-        if 200 <= r.status_code < 300 and _AUTH_STYLE is None:
-            _AUTH_STYLE = style
-        r.raise_for_status()
-        return r
-
-    # сюда придём только если был 401 в первом стиле и ошибка/401 во втором
-    # сделаем последнюю попытку вторым стилем, чтобы поднять корректную ошибку
-    fallback = "bearer" if tried and tried[0] == "plain" else "plain"
-    r = requests.get(url, headers=_headers(fallback), params=params, timeout=timeout)
-    if 200 <= r.status_code < 300 and _AUTH_STYLE is None:
-        _AUTH_STYLE = fallback
-    r.raise_for_status()
-    return r
-
-
-# === API Wildberries ===
-def create_task(d_from: dt.date, d_to: dt.date) -> str:
-    # Создать задачу — GET /api/v1/paid_storage?dateFrom=...&dateTo=...
-    r = _get(
-        f"{WB_BASE}/api/v1/paid_storage",
-        params={"dateFrom": d_from.isoformat(), "dateTo": d_to.isoformat()},
-        timeout=60,
-    )
-    js = r.json()
-    return js["data"]["taskId"]
-
-
-def task_status(task_id: str) -> str:
-    r = _get(
-        f"{WB_BASE}/api/v1/paid_storage/tasks/{task_id}/status",
-        timeout=60,
-    )
-    js = r.json()
-    return js["data"]["status"]
-
-
-def download_report(task_id: str) -> List[Dict[str, Any]]:
-    r = _get(
-        f"{WB_BASE}/api/v1/paid_storage/tasks/{task_id}/download",
-        timeout=120,
-    )
-    return r.json()  # массив объектов
-
-
-def wait_task(task_id: str, max_wait_sec: int = 600, poll_sec: int = 8) -> None:
-    """Ждём статуса done до max_wait_sec. Бросаем исключение при timeout или ошибке."""
-    start = time.time()
-    while True:
-        st = task_status(task_id)
-        elapsed = int(time.time() - start)
-        if st == "done":
-            return
-        if st in {"canceled", "error", "failed"}:
-            raise RuntimeError(f"WB task {task_id} failed with status={st}")
-        if elapsed >= max_wait_sec:
-            raise TimeoutError(f"WB task {task_id} timeout")
-        # красивые логи только раз в ~минуту (чтобы не засорять)
-        if elapsed % 60 in (0, 1):
-            print(f"waiting WB task {task_id}, status={st}, elapsed={elapsed}s")
-        time.sleep(poll_sec)
-
-
-# === Supabase ===
-def supabase_client() -> Client:
+# === Вспомогательные ===
+def supa():
     return create_client(SB_URL, SB_KEY)
 
-
-def map_row(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Приводим ключи и типы под схему:
-    PK: (date, nm_id, chrt_id, office_id)
-    """
-    def to_float(x):
-        if x is None or x == "":
-            return None
-        return float(x)
-
-    def to_int(x):
-        if x is None or x == "":
-            return None
-        return int(x)
-
-    out = {
-        "date": raw.get("date"),  # YYYY-MM-DD
-        "log_warehouse_coef": to_float(raw.get("logWarehouseCoef")),
-        "office_id": to_int(raw.get("officeId")),
-        "warehouse": raw.get("warehouse"),
-        "warehouse_coef": to_float(raw.get("warehouseCoef")),
-        "gi_id": to_int(raw.get("giId")),
-        "chrt_id": to_int(raw.get("chrtId")),
-        "size": raw.get("size"),
-        "barcode": raw.get("barcode"),
-        "subject": raw.get("subject"),
-        "brand": raw.get("brand"),
-        "vendor_code": raw.get("vendorCode"),
-        "nm_id": to_int(raw.get("nmId")),
-        "volume": to_float(raw.get("volume")),
-        "calc_type": raw.get("calcType"),
-        "warehouse_price": to_float(raw.get("warehousePrice")),
-        "barcodes_count": to_int(raw.get("barcodesCount")),
-        "pallet_place_code": to_int(raw.get("palletPlaceCode")),
-        "pallet_count": to_int(raw.get("palletCount")),
-        "original_date": raw.get("originalDate"),
-        "loyalty_discount": to_float(raw.get("loyaltyDiscount")),
-        "tariff_fix_date": raw.get("tariffFixDate"),
-        "tariff_lower_date": raw.get("tariffLowerDate"),
-    }
-    return out
-
-
-def upsert_rows(rows: List[Dict[str, Any]]) -> None:
-    if not rows:
-        return
-    sb = supabase_client()
-    # батчами по 1000 — так надёжнее
-    BATCH = 1000
-    for i in range(0, len(rows), BATCH):
-        batch = rows[i:i + BATCH]
-        # on_conflict должен соответствовать PK, чтобы не было дублей
-        res = sb.table(TABLE).insert(batch, upsert=True, on_conflict="date,nm_id,chrt_id,office_id").execute()
-        # не бросаем, но логируем размер
-    # можно вывести общий счётчик
-    print(f"rows upserted: {len(rows)}")
-
-
-# === Основная логика ===
-def fetch_window(d_from: dt.date, d_to: dt.date) -> None:
-    for attempt in range(1, 4):
-        try:
-            task_id = create_task(d_from, d_to)
-            wait_task(task_id, max_wait_sec=600, poll_sec=8)
-            data = download_report(task_id)
-            print(f"rows downloaded: {len(data)} for {d_from}..{d_to}")
-            rows = [map_row(r) for r in data]
-            upsert_rows(rows)
-            return
-        except requests.HTTPError as e:
-            # 429/5xx/… — подождём и повторим
-            print(f"Retry ({attempt}) HTTP: {e}")
-            time.sleep(30 * attempt)
-        except TimeoutError as e:
-            print(f"Retry ({attempt}) {e}")
-            time.sleep(30 * attempt)
-        except Exception as e:
-            print(f"Retry ({attempt}) {e}")
-            time.sleep(15 * attempt)
-    # если все попытки сгорели — бросаем
-    raise RuntimeError(f"Failed to fetch {d_from}..{d_to} after retries")
-
-
-def mode_range(date_from: str, date_to: str) -> None:
-    a = dt.date.fromisoformat(date_from)
-    b = dt.date.fromisoformat(date_to)
-    print(f"[RANGE] {a}..{b}")
-    for df, dt_ in chunks_8days(a, b):
-        fetch_window(df, dt_)
-
-
-def mode_backfill(year: str) -> None:
-    y = int(year)
-    a = dt.date(y, 1, 1)
-    b = dt.date(y, 12, 31)
-    cur = a
-    while cur <= b:
-        end = min(cur + dt.timedelta(days=WB_MAX_WINDOW_DAYS - 1), b)
-        print(f"[BACKFILL] {cur}..{end}")
-        fetch_window(cur, end)
+def chunks_8days(d1: dt.date, d2: dt.date):
+    cur = d1
+    while cur <= d2:
+        end = min(cur + dt.timedelta(days=MAX_DAYS-1), d2)
+        yield cur, end
         cur = end + dt.timedelta(days=1)
 
+def create_task(d_from: dt.date, d_to: dt.date) -> str:
+    url = f"{WB_BASE}/api/v1/paid_storage"
+    r = requests.get(url, params={"dateFrom": d_from.isoformat(), "dateTo": d_to.isoformat()}, headers=HEADERS, timeout=60)
+    r.raise_for_status()
+    return r.json()["data"]["taskId"]
 
-def mode_since(date_from: str) -> None:
+def task_status(task_id: str) -> str:
+    """Читает статус задачи, без _auth_header. Делает fallback Bearer<->plain и бэкофф при 429/5xx."""
+    url = f"{WB_BASE}/api/v1/paid_storage/tasks/{task_id}/status"
+    delay = 5
+
+    # основной и запасной варианты заголовков
+    bearer = HEADERS
+    plain  = { "Authorization": WB_TOKEN, "Accept": "application/json" }
+    first, second = bearer, plain
+    if not str(bearer.get("Authorization", "")).lower().startswith("bearer"):
+        first, second = plain, bearer
+
+    for attempt in range(10):
+        r = requests.get(url, headers=first, timeout=60)
+        if r.status_code == 401:
+            r = requests.get(url, headers=second, timeout=60)
+
+        if r.status_code == 429 or 500 <= r.status_code < 600:
+            time.sleep(delay)
+            delay = min(delay + 5, 30)
+            continue
+
+        r.raise_for_status()
+        return r.json()["data"]["status"]
+
+    raise RuntimeError("WB status polling failed after retries")
+
+def wait_done(task_id: str):
+    start = time.time()
+    last_print = 0
+    while True:
+        s = task_status(task_id)
+        now = time.time()
+        if s == "done":
+            return
+        if s in ("error", "failed"):
+            raise RuntimeError(f"Task {task_id} failed: {s}")
+        if now - start > TIMEOUT_SECONDS:
+            raise TimeoutError(f"Task {task_id} timeout (> {TIMEOUT_SECONDS}s)")
+        if now - last_print > 60:
+            print(f"waiting WB task {task_id}, status={s}, elapsed={int(now-start)}s")
+            last_print = now
+        time.sleep(POLL_EVERY_SECONDS)
+
+def download_report(task_id: str) -> List[Dict[str, Any]]:
+    url = f"{WB_BASE}/api/v1/paid_storage/tasks/{task_id}/download"
+    delay = 65  # лимит download = 1/мин
+    for attempt in range(8):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=120)
+            r.raise_for_status()
+            return r.json()
+        except requests.HTTPError as e:
+            if getattr(e.response, "status_code", None) == 429:
+                print(f"429 on download, sleep {delay}s (attempt {attempt+1}/8)")
+                time.sleep(delay)
+                delay = min(delay + 15, 120)
+                continue
+            raise
+
+def norm_date(v):
+    return None if not v else v[:10]
+
+def normalize_row(row: Dict[str, Any], task_id: str) -> Dict[str, Any]:
+    out = {
+        "date":               norm_date(row.get("date")),
+        "log_warehouse_coef": row.get("logWarehouseCoef"),
+        "office_id":          row.get("officeId"),
+        "warehouse":          row.get("warehouse"),
+        "warehouse_coef":     row.get("warehouseCoef"),
+        "gi_id":              row.get("giId"),
+        "chrt_id":            row.get("chrtId"),
+        "size":               row.get("size"),
+        "barcode":            row.get("barcode"),
+        "subject":            row.get("subject"),
+        "brand":              row.get("brand"),
+        "vendor_code":        row.get("vendorCode"),
+        "nm_id":              row.get("nmId"),
+        "volume":             row.get("volume"),
+        "calc_type":          row.get("calcType"),
+        "warehouse_price":    row.get("warehousePrice"),
+        "barcodes_count":     row.get("barcodesCount"),
+        "pallet_place_code":  row.get("palletPlaceCode"),
+        "pallet_count":       row.get("palletCount"),
+        "original_date":      norm_date(row.get("originalDate")),
+        "loyalty_discount":   row.get("loyaltyDiscount"),
+        "tariff_fix_date":    norm_date(row.get("tariffFixDate")),
+        "tariff_lower_date":  norm_date(row.get("tariffLowerDate")),
+        "_source_task_id":    task_id,
+    }
+    h = hashlib.sha256(json.dumps(out, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    out["_hash"] = h
+    return out
+
+def upsert(rows: List[Dict[str, Any]]):
+    if not rows:
+        return
+    # снимаем дубли по PK в рамках пакета
+    dedup = {}
+    for r in rows:
+        key = (r.get("date"), r.get("nm_id"), r.get("chrt_id"), r.get("office_id"))
+        dedup[key] = r
+    clean_rows = list(dedup.values())
+
+    client = supa()
+    for i in range(0, len(clean_rows), 1000):
+        chunk = clean_rows[i:i+1000]
+        client.table("wb_paid_storage_x").upsert(
+            chunk,
+            on_conflict="date,nm_id,chrt_id,office_id"
+        ).execute()
+
+def fetch_window(d_from: dt.date, d_to: dt.date):
+    task_id = create_task(d_from, d_to)
+    time.sleep(2)  # небольшой лаг перед опросом
+    wait_done(task_id)
+    data = download_report(task_id)
+    print(f"rows downloaded: {len(data)} for {d_from}..{d_to}")
+    rows = [normalize_row(r, task_id) for r in data]
+    upsert(rows)
+    time.sleep(65)  # пауза чтобы не ловить 429 на следующем окне
+
+# === Режимы ===
+def backfill(year: int):
+    start, end = dt.date(year,1,1), dt.date(year,12,31)
+    for a,b in chunks_8days(start, end):
+        print(f"[BACKFILL] {a}..{b}")
+        for attempt in range(3):
+            try:
+                fetch_window(a,b); break
+            except Exception as e:
+                print("Retry:", e); time.sleep(30)
+
+def sync(days_back: int = 8):
+    today = dt.date.today()
+    start = today - dt.timedelta(days=days_back-1)
+    for a,b in chunks_8days(start, today):
+        print(f"[SYNC] {a}..{b}")
+        for attempt in range(3):
+            try:
+                fetch_window(a,b); break
+            except Exception as e:
+                print("Retry:", e); time.sleep(30)
+
+def mode_range(date_from: str, date_to: str):
+    a = dt.date.fromisoformat(date_from)
+    b = dt.date.fromisoformat(date_to)
+    for df, dt_ in chunks_8days(a, b):
+        print(f"[RANGE] {df}..{dt_}")
+        for attempt in range(3):
+            try:
+                fetch_window(df, dt_); break
+            except Exception as e:
+                print("Retry:", e); time.sleep(30)
+
+def since(date_from: str):
     a = dt.date.fromisoformat(date_from)
     b = dt.date.today()
     mode_range(a.isoformat(), b.isoformat())
 
-
-def mode_sync(days_back: int = 8) -> None:
-    # ежедневно гоняем последние N дней (по умолчанию 8, чтобы точно помещалось в один запрос)
-    today = dt.date.today()
-    start = today - dt.timedelta(days=days_back - 1)
-    # WB включает обе границы -> 8 дней = [today-7 .. today]
-    print(f"[SYNC] {start}..{today}")
-    fetch_window(start, today)
-
-
-def main():
+if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage:")
-        print("  python wb_paid_storage_sync.py backfill 2024")
-        print("  python wb_paid_storage_sync.py range YYYY-MM-DD YYYY-MM-DD")
-        print("  python wb_paid_storage_sync.py since YYYY-MM-DD")
-        print("  python wb_paid_storage_sync.py sync [DAYS_BACK]")
+        print("Usage: backfill <year> | sync [days_back] | range <YYYY-MM-DD> <YYYY-MM-DD> | since <YYYY-MM-DD>")
         sys.exit(1)
-
     mode = sys.argv[1]
     if mode == "backfill":
-        year = sys.argv[2]
-        mode_backfill(year)
-    elif mode == "range":
-        date_from, date_to = sys.argv[2], sys.argv[3]
-        mode_range(date_from, date_to)
-    elif mode == "since":
-        date_from = sys.argv[2]
-        mode_since(date_from)
+        backfill(int(sys.argv[2]))
     elif mode == "sync":
-        days_back = int(sys.argv[2]) if len(sys.argv) > 2 else 8
-        if days_back < 1 or days_back > WB_MAX_WINDOW_DAYS:
-            # держим в разумных рамках, чтобы не выходить за лимит WB
-            days_back = min(max(days_back, 1), WB_MAX_WINDOW_DAYS)
-        mode_sync(days_back)
+        sync(int(sys.argv[2]) if len(sys.argv) > 2 else 8)
+    elif mode == "range":
+        mode_range(sys.argv[2], sys.argv[3])
+    elif mode == "since":
+        since(sys.argv[2])
     else:
-        raise SystemExit(f"Unknown mode: {mode}")
-
-
-if __name__ == "__main__":
-    main()
+        print("Unknown mode")
+        sys.exit(1)
