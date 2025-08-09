@@ -15,13 +15,17 @@ SB_KEY    = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 HEADERS = {
     "Authorization": f"Bearer {WB_TOKEN}",
     "Accept": "application/json",
-    "User-Agent": "wb-paid-storage-sync/1.0"
+    "User-Agent": "wb-paid-storage-sync/1.1"
 }
 
-# Предел окна (в днях) и прочие параметры
+# Параметры
 MAX_DAYS = 8
 BATCH_SIZE = 1000
-BASE_TIMEOUT = 60  # сек
+REQ_TIMEOUT = 60
+STATUS_MAX_WAIT = 240   # макс. ожидание статуса, сек (4 мин)
+STATUS_POLL_STEP_MIN = 5
+STATUS_POLL_STEP_MAX = 20
+DOWNLOAD_RETRIES = 6    # попытки скачать отчёт (учитывая лимит 1/мин)
 
 # === Вспомогательные ===
 def supa():
@@ -34,52 +38,29 @@ def chunks_8days(d1: dt.date, d2: dt.date):
         yield cur, end
         cur = end + dt.timedelta(days=1)
 
-def get_with_retries(url: str, params: Dict[str, Any], max_tries: int = 6, timeout: int = BASE_TIMEOUT):
-    """
-    Аккуратный GET с автоматическими ретраями на 429/5xx.
-    На 401 — сразу ошибка (ключ неверный).
-    Бэк-офф экспоненциальный + немного джиттера.
-    """
+def http_get(url: str, params: Dict[str, Any], timeout: int = REQ_TIMEOUT) -> Any:
     delay = 2
-    last_err: Optional[Exception] = None
-    for attempt in range(1, max_tries+1):
-        try:
-            r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
-            if r.status_code == 401:
-                # неавторизован — нет смысла ретраить
-                r.raise_for_status()
-            if r.status_code in (429,) or 500 <= r.status_code < 600:
-                # перегрузка/rate-limit — подождём и попробуем снова
-                last_err = requests.HTTPError(f"{r.status_code} for {url}", response=r)
-                sleep_for = delay + random.uniform(0, 1.0)
-                print(f"WB {r.status_code}, retry in {sleep_for:.1f}s (attempt {attempt}/{max_tries})")
-                time.sleep(sleep_for)
-                delay = min(delay * 2, 30)
-                continue
+    for attempt in range(1, 7):
+        r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
+        if r.status_code == 401:
             r.raise_for_status()
-            # Пытаемся распарсить JSON, иначе кидаем осмысленную ошибку
-            try:
-                return r.json()
-            except ValueError:
-                raise RuntimeError(f"WB returned non-JSON response (HTTP {r.status_code})")
-        except Exception as e:
-            last_err = e
-            if attempt == max_tries:
-                break
+        if r.status_code in (429,) or 500 <= r.status_code < 600:
             sleep_for = delay + random.uniform(0, 1.0)
-            print(f"Retry: {e}, wait {sleep_for:.1f}s (attempt {attempt}/{max_tries})")
+            print(f"WB {r.status_code}, retry in {sleep_for:.1f}s (attempt {attempt}/6)")
             time.sleep(sleep_for)
-            delay = min(delay * 2, 30)
-    # если здесь — значит не смогли получить валидный ответ
-    raise RuntimeError(f"WB request failed after {max_tries} attempts: {last_err}")
+            delay = min(delay*2, 30)
+            continue
+        r.raise_for_status()
+        try:
+            return r.json()
+        except ValueError:
+            raise RuntimeError(f"WB returned non-JSON (HTTP {r.status_code})")
+    raise RuntimeError("WB request failed after retries")
 
 def norm_date(v: Any) -> Optional[str]:
     return None if not v else str(v)[:10]
 
 def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Нормализация WB -> наши поля (snake_case).
-    """
     out = {
         "date":               norm_date(row.get("date")),
         "log_warehouse_coef": row.get("logWarehouseCoef"),
@@ -105,7 +86,6 @@ def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "tariff_fix_date":    norm_date(row.get("tariffFixDate")),
         "tariff_lower_date":  norm_date(row.get("tariffLowerDate")),
     }
-    # Детерминированный хэш для контроля изменений
     out["_hash"] = hashlib.sha256(
         json.dumps(out, sort_keys=True, ensure_ascii=False).encode("utf-8")
     ).hexdigest()
@@ -114,14 +94,13 @@ def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
 def upsert(rows: List[Dict[str, Any]]):
     if not rows:
         return
-    # 1) убрать локальные дубли (на всякий случай)
+    # локальная дедупликация
     dedup: Dict[tuple, Dict[str, Any]] = {}
     for r in rows:
         key = (r.get("date"), r.get("nm_id"), r.get("chrt_id"), r.get("office_id"))
         dedup[key] = r
     clean_rows = list(dedup.values())
 
-    # 2) upsert пачками
     client = supa()
     for i in range(0, len(clean_rows), BATCH_SIZE):
         chunk = clean_rows[i:i+BATCH_SIZE]
@@ -131,16 +110,8 @@ def upsert(rows: List[Dict[str, Any]]):
         ).execute()
 
 def extract_rows(payload: Any) -> List[Dict[str, Any]]:
-    """
-    WB иногда отдаёт:
-      - сразу list,
-      - dict с ключом data -> list,
-      - dict с data -> dict и там уже rows/items/list/...
-    Приводим всё к list.
-    """
     if isinstance(payload, list):
         return payload
-
     if isinstance(payload, dict):
         v = payload.get("data", payload)
         if isinstance(v, list):
@@ -149,33 +120,95 @@ def extract_rows(payload: Any) -> List[Dict[str, Any]]:
             for k in ("rows", "items", "elements", "list", "result"):
                 if isinstance(v.get(k), list):
                     return v[k]
-
-    # неизвестная форма — вернём пустой список, а наверху решим, что делать
+            # если это старт таска — там бывает только taskId
+            if "taskId" in v and isinstance(v["taskId"], str):
+                return []  # пусть верхний уровень распознает как "путь через таск"
     return []
 
+# === Работа через таск WB (если API вернул taskId) ===
+def poll_status(task_id: str) -> str:
+    url = f"{WB_BASE}/api/v1/paid_storage/tasks/{task_id}/status"
+    waited = 0
+    step = STATUS_POLL_STEP_MIN
+    while waited < STATUS_MAX_WAIT:
+        r = requests.get(url, headers=HEADERS, timeout=REQ_TIMEOUT)
+        if r.status_code == 401:
+            r.raise_for_status()
+        if r.status_code in (429,) or 500 <= r.status_code < 600:
+            time.sleep(step)
+            waited += step
+            step = min(step + 2, STATUS_POLL_STEP_MAX)
+            continue
+        r.raise_for_status()
+        js = r.json()
+        status = js.get("data", {}).get("status") or js.get("status")
+        if status in ("done", "error", "failed"):
+            return status or "unknown"
+        # печать “пульса” примерно раз в ~минуту
+        if waited % 60 == 0:
+            print(f"waiting WB task {task_id}, status={status or 'unknown'}, elapsed={waited}s")
+        time.sleep(step)
+        waited += step
+        step = min(step + 2, STATUS_POLL_STEP_MAX)
+    return "timeout"
+
+def download_report(task_id: str) -> List[Dict[str, Any]]:
+    url = f"{WB_BASE}/api/v1/paid_storage/tasks/{task_id}/download"
+    delay = 65
+    for attempt in range(1, DOWNLOAD_RETRIES+1):
+        r = requests.get(url, headers=HEADERS, timeout=REQ_TIMEOUT)
+        if r.status_code == 401:
+            r.raise_for_status()
+        if r.status_code == 429:
+            print(f"429 on download, sleep {delay}s (attempt {attempt}/{DOWNLOAD_RETRIES})")
+            time.sleep(delay)
+            delay = min(delay + 15, 120)
+            continue
+        r.raise_for_status()
+        payload = r.json()
+        data = extract_rows(payload)
+        if isinstance(data, list):
+            return data
+        # если пришёл не список — покажем фрагмент и попробуем ещё раз (редко бывает)
+        print("Unexpected download payload, retrying...",
+              json.dumps(payload, ensure_ascii=False)[:200])
+        time.sleep(10)
+    raise RuntimeError("WB download failed after retries")
+
+# === Основное окно ===
 def fetch_window(d_from: dt.date, d_to: dt.date):
-    """
-    Быстрый путь: прямой вызов отчёта без тасков.
-    """
     url = f"{WB_BASE}/api/v1/paid_storage"
     params = {"dateFrom": d_from.isoformat(), "dateTo": d_to.isoformat()}
-    payload = get_with_retries(url, params)
+    payload = http_get(url, params)
 
+    # 1) попытка вытащить сразу строки
     data = extract_rows(payload)
+    # 2) если строк нет, но это taskId — идём по таску
+    task_id: Optional[str] = None
+    if isinstance(payload, dict):
+        v = payload.get("data", payload)
+        if isinstance(v, dict):
+            task_id = v.get("taskId")
+
+    if not data and task_id:
+        status = poll_status(task_id)
+        if status == "done":
+            data = download_report(task_id)
+        elif status in ("error", "failed"):
+            raise RuntimeError(f"Task {task_id} failed: {status}")
+        else:
+            # new/timeout — логируем и выходим мягко: следующий запуск доберёт
+            print(f"Task {task_id} not ready ({status}). Will retry on next run.")
+            return
+
     if not isinstance(data, list):
         snippet = json.dumps(payload, ensure_ascii=False)[:500]
         raise RuntimeError(f"Unexpected WB response (not list). First 500 chars: {snippet}")
-    if len(data) == 0 and isinstance(payload, dict) and payload:
-        # Поможем себе в логах при пустом извлечении
-        print("WB returned dict payload, but no list found in typical keys. First 500 chars:")
-        print(json.dumps(payload, ensure_ascii=False)[:500])
 
     print(f"rows downloaded: {len(data)} for {d_from}..{d_to}")
     rows = [normalize_row(r) for r in data]
     upsert(rows)
-
-    # Небольшая пауза, чтобы не долбить WB подряд окнами
-    time.sleep(2)
+    time.sleep(2)  # лёгкая пауза между окнами
 
 # === Режимы ===
 def backfill(year: int):
@@ -235,7 +268,5 @@ if __name__ == "__main__":
             print("Unknown mode")
             sys.exit(1)
     except KeyError as ke:
-        # дружелюбная ошибка, если не выставлены переменные окружения
-        miss = str(ke).strip("'")
-        print(f"Missing required environment variable: {miss}")
+        print(f"Missing required environment variable: {str(ke).strip(\"'\")}")
         sys.exit(2)
