@@ -84,7 +84,7 @@ def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "original_date":      norm_date(row.get("originalDate")),
         "loyalty_discount":   row.get("loyaltyDiscount"),
         "tariff_fix_date":    norm_date(row.get("tariffFixDate")),
-        "tariff_lower_date":  norm_date(row.get("tariffLowerDate")),
+        "tariff_lower_date":  row.get("tariffLowerDate"),
     }
     out["_hash"] = hashlib.sha256(
         json.dumps(out, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -144,7 +144,7 @@ def poll_status(task_id: str) -> str:
         status = js.get("data", {}).get("status") or js.get("status")
         if status in ("done", "error", "failed"):
             return status or "unknown"
-        # печать “пульса” примерно раз в ~минуту
+        # “пульс” примерно раз в минуту
         if waited % 60 == 0:
             print(f"waiting WB task {task_id}, status={status or 'unknown'}, elapsed={waited}s")
         time.sleep(step)
@@ -169,7 +169,7 @@ def download_report(task_id: str) -> List[Dict[str, Any]]:
         data = extract_rows(payload)
         if isinstance(data, list):
             return data
-        # если пришёл не список — покажем фрагмент и попробуем ещё раз (редко бывает)
+        # если пришёл не список — покажем фрагмент и попробуем ещё раз
         print("Unexpected download payload, retrying...",
               json.dumps(payload, ensure_ascii=False)[:200])
         time.sleep(10)
@@ -268,5 +268,6 @@ if __name__ == "__main__":
             print("Unknown mode")
             sys.exit(1)
     except KeyError as ke:
-        print(f"Missing required environment variable: {str(ke).strip(\"'\")}")
+        missing_env = str(ke).strip("'")
+        print(f"Missing required environment variable: {missing_env}")
         sys.exit(2)
