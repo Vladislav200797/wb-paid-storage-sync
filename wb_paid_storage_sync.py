@@ -1,119 +1,71 @@
+# wb_paid_storage_sync.py
 import os, sys, time, json, hashlib, datetime as dt
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 import requests
 from supabase import create_client
 
+# === Конфиг через переменные окружения ===
 WB_BASE   = os.getenv("WB_API_BASE", "https://seller-analytics-api.wildberries.ru")
-WB_TOKEN  = os.environ["WB_API_TOKEN"]
-SB_URL    = os.environ["SUPABASE_URL"]
-SB_KEY    = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+WB_TOKEN  = os.environ["WB_API_TOKEN"]                 # секрет WB_API_TOKEN
+SB_URL    = os.environ["SUPABASE_URL"]                 # секрет SUPABASE_URL
+SB_KEY    = os.environ["SUPABASE_SERVICE_ROLE_KEY"]    # секрет SUPABASE_SERVICE_ROLE_KEY
 
-# по умолчанию — Bearer, как в твоём «быстром» варианте
-HEADERS = { "Authorization": f"Bearer {WB_TOKEN}", "Accept": "application/json" }
+HEADERS = {
+    "Authorization": f"Bearer {WB_TOKEN}",
+    "Accept": "application/json",
+}
 
-MAX_DAYS = 8
-POLL_EVERY_SECONDS = 10
-TIMEOUT_SECONDS = 1800
+MAX_DAYS_PER_CALL = 8
+RETRY_MAX = 6
+RETRY_BASE_SLEEP = 2.0   # сек
+HTTP_TIMEOUT = 60        # сек
+UPSERT_CHUNK = 1000
 
-# === Вспомогательные ===
+# ===== helpers =====
 def supa():
     return create_client(SB_URL, SB_KEY)
 
-def chunks_8days(d1: dt.date, d2: dt.date):
+def chunks_8days(d1: dt.date, d2: dt.date) -> List[Tuple[dt.date, dt.date]]:
     cur = d1
     while cur <= d2:
-        end = min(cur + dt.timedelta(days=MAX_DAYS-1), d2)
+        end = min(cur + dt.timedelta(days=MAX_DAYS_PER_CALL-1), d2)
         yield cur, end
         cur = end + dt.timedelta(days=1)
 
-def create_task(d_from: dt.date, d_to: dt.date) -> str:
-    url = f"{WB_BASE}/api/v1/paid_storage"
-    r = requests.get(url, params={"dateFrom": d_from.isoformat(), "dateTo": d_to.isoformat()}, headers=HEADERS, timeout=60)
-    r.raise_for_status()
-    return r.json()["data"]["taskId"]
-
-def task_status(task_id: str) -> str:
-    """Читает статус задачи, без _auth_header. Делает fallback Bearer<->plain и бэкофф при 429/5xx."""
-    url = f"{WB_BASE}/api/v1/paid_storage/tasks/{task_id}/status"
-    delay = 5
-
-    # основной и запасной варианты заголовков
-    bearer = HEADERS
-    plain  = { "Authorization": WB_TOKEN, "Accept": "application/json" }
-    first, second = bearer, plain
-    if not str(bearer.get("Authorization", "")).lower().startswith("bearer"):
-        first, second = plain, bearer
-
-    for attempt in range(10):
-        r = requests.get(url, headers=first, timeout=60)
-        if r.status_code == 401:
-            r = requests.get(url, headers=second, timeout=60)
-
-        if r.status_code == 429 or 500 <= r.status_code < 600:
-            time.sleep(delay)
-            delay = min(delay + 5, 30)
-            continue
-
-        r.raise_for_status()
-        return r.json()["data"]["status"]
-
-    raise RuntimeError("WB status polling failed after retries")
-
-def wait_done_or_recreate(task_id: str, d_from: dt.date, d_to: dt.date, max_new_seconds: int = 180) -> str:
+def get_with_retries(url: str, params: Dict[str, str]) -> Dict[str, Any]:
     """
-    Ждём готовности задачи. Если слишком долго висит в status=new — пересоздаём задачу.
-    Возвращает итоговый task_id, у которого статус стал done.
+    Делает GET с экспоненциальным ретраем на 401/429/5xx.
     """
-    start = time.time()
-    last_print = 0
-    current_task = task_id
-
-    while True:
-        s = task_status(current_task)
-        now = time.time()
-
-        if s == "done":
-            return current_task
-        if s in ("error", "failed"):
-            raise RuntimeError(f"Task {current_task} failed: {s}")
-
-        # слишком долго в очереди — пересоздаём
-        if s == "new" and (now - start) > max_new_seconds:
-            print(f"status=new > {max_new_seconds}s, recreate WB task for {d_from}..{d_to}")
-            # мягкая пауза перед новым созданием
-            time.sleep(2)
-            current_task = create_task(d_from, d_to)
-            start = time.time()
-            last_print = 0
-            # небольшой лаг перед первым опросом нового task
-            time.sleep(2)
-            continue
-
-        if now - last_print > 60:
-            print(f"waiting WB task {current_task}, status={s}, elapsed={int(now-start)}s")
-            last_print = now
-        time.sleep(POLL_EVERY_SECONDS)
-
-def download_report(task_id: str) -> List[Dict[str, Any]]:
-    url = f"{WB_BASE}/api/v1/paid_storage/tasks/{task_id}/download"
-    delay = 65  # лимит download = 1/мин
-    for attempt in range(8):
+    delay = RETRY_BASE_SLEEP
+    for attempt in range(1, RETRY_MAX + 1):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=120)
+            r = requests.get(url, headers=HEADERS, params=params, timeout=HTTP_TIMEOUT)
+            # мягкая обработка перегрузок
+            if r.status_code in (429,) or 500 <= r.status_code < 600:
+                raise requests.HTTPError(f"{r.status_code} Retriable", response=r)
             r.raise_for_status()
             return r.json()
         except requests.HTTPError as e:
-            if getattr(e.response, "status_code", None) == 429:
-                print(f"429 on download, sleep {delay}s (attempt {attempt+1}/8)")
+            code = getattr(e.response, "status_code", None)
+            # на 401 у WB бывает редкий глюк — пробуем ещё раз
+            if code in (401, 429) or (code is not None and 500 <= code < 600):
+                if attempt < RETRY_MAX:
+                    time.sleep(delay)
+                    delay = min(delay * 1.8, 20)
+                    continue
+            raise
+        except requests.RequestException:
+            if attempt < RETRY_MAX:
                 time.sleep(delay)
-                delay = min(delay + 15, 120)
+                delay = min(delay * 1.8, 20)
                 continue
             raise
 
-def norm_date(v):
-    return None if not v else v[:10]
+def norm_date(v: Any):
+    return None if not v else str(v)[:10]
 
-def normalize_row(row: Dict[str, Any], task_id: str) -> Dict[str, Any]:
+def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    # WB -> snake_case для нашей таблицы
     out = {
         "date":               norm_date(row.get("date")),
         "log_warehouse_coef": row.get("logWarehouseCoef"),
@@ -138,66 +90,77 @@ def normalize_row(row: Dict[str, Any], task_id: str) -> Dict[str, Any]:
         "loyalty_discount":   row.get("loyaltyDiscount"),
         "tariff_fix_date":    norm_date(row.get("tariffFixDate")),
         "tariff_lower_date":  norm_date(row.get("tariffLowerDate")),
-        "_source_task_id":    task_id,
     }
-    h = hashlib.sha256(json.dumps(out, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-    out["_hash"] = h
+    # детерминированный хэш для контроля изменений
+    out["_hash"] = hashlib.sha256(
+        json.dumps(out, sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()
     return out
 
 def upsert(rows: List[Dict[str, Any]]):
     if not rows:
         return
-    # снимаем дубли по PK в рамках пакета
+    # внутри батча удалим дубликаты PK (date, nm_id, chrt_id, office_id)
     dedup = {}
     for r in rows:
         key = (r.get("date"), r.get("nm_id"), r.get("chrt_id"), r.get("office_id"))
         dedup[key] = r
-    clean_rows = list(dedup.values())
+    clean = list(dedup.values())
 
     client = supa()
-    for i in range(0, len(clean_rows), 1000):
-        chunk = clean_rows[i:i+1000]
+    for i in range(0, len(clean), UPSERT_CHUNK):
+        chunk = clean[i:i+UPSERT_CHUNK]
         client.table("wb_paid_storage_x").upsert(
             chunk,
             on_conflict="date,nm_id,chrt_id,office_id"
         ).execute()
 
 def fetch_window(d_from: dt.date, d_to: dt.date):
-    task_id = create_task(d_from, d_to)
-    # небольшой лаг перед первым опросом
-    time.sleep(2)
-    # ждём готовности; если застрянет в new — функция сама пересоздаст задачу
-    task_id = wait_done_or_recreate(task_id, d_from, d_to, max_new_seconds=180)
+    """
+    Прямой запрос без тасков:
+    GET /api/v1/paid_storage?dateFrom=YYYY-MM-DD&dateTo=YYYY-MM-DD
+    """
+    url = f"{WB_BASE}/api/v1/paid_storage"
+    params = {"dateFrom": d_from.isoformat(), "dateTo": d_to.isoformat()}
+    payload = get_with_retries(url, params)
 
-    data = download_report(task_id)
+    # WB может вернуть {"data":[...]} или сразу список — поддержим оба
+    data = payload.get("data", payload)
+
+    if not isinstance(data, list):
+        raise RuntimeError(f"Unexpected WB response: {type(data)}")
+
     print(f"rows downloaded: {len(data)} for {d_from}..{d_to}")
-    rows = [normalize_row(r, task_id) for r in data]
+
+    rows = [normalize_row(r) for r in data]
     upsert(rows)
 
-    # пауза, чтобы не поймать 429 на следующем окне
-    time.sleep(65)
+    # бережная пауза, чтобы не словить 429 при последовательных окнах
+    time.sleep(2)
 
-# === Режимы ===
+# ===== режимы =====
 def backfill(year: int):
-    start, end = dt.date(year,1,1), dt.date(year,12,31)
-    for a,b in chunks_8days(start, end):
+    start, end = dt.date(year, 1, 1), dt.date(year, 12, 31)
+    for a, b in chunks_8days(start, end):
         print(f"[BACKFILL] {a}..{b}")
         for attempt in range(3):
             try:
-                fetch_window(a,b); break
+                fetch_window(a, b)
+                break
             except Exception as e:
-                print("Retry:", e); time.sleep(30)
+                print("Retry:", e); time.sleep(5)
 
 def sync(days_back: int = 8):
     today = dt.date.today()
     start = today - dt.timedelta(days=days_back-1)
-    for a,b in chunks_8days(start, today):
+    for a, b in chunks_8days(start, today):
         print(f"[SYNC] {a}..{b}")
         for attempt in range(3):
             try:
-                fetch_window(a,b); break
+                fetch_window(a, b)
+                break
             except Exception as e:
-                print("Retry:", e); time.sleep(30)
+                print("Retry:", e); time.sleep(5)
 
 def mode_range(date_from: str, date_to: str):
     a = dt.date.fromisoformat(date_from)
@@ -206,9 +169,10 @@ def mode_range(date_from: str, date_to: str):
         print(f"[RANGE] {df}..{dt_}")
         for attempt in range(3):
             try:
-                fetch_window(df, dt_); break
+                fetch_window(df, dt_)
+                break
             except Exception as e:
-                print("Retry:", e); time.sleep(30)
+                print("Retry:", e); time.sleep(5)
 
 def since(date_from: str):
     a = dt.date.fromisoformat(date_from)
@@ -219,6 +183,7 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: backfill <year> | sync [days_back] | range <YYYY-MM-DD> <YYYY-MM-DD> | since <YYYY-MM-DD>")
         sys.exit(1)
+
     mode = sys.argv[1]
     if mode == "backfill":
         backfill(int(sys.argv[2]))
@@ -231,4 +196,3 @@ if __name__ == "__main__":
     else:
         print("Unknown mode")
         sys.exit(1)
-
