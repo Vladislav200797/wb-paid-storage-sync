@@ -59,20 +59,38 @@ def task_status(task_id: str) -> str:
 
     raise RuntimeError("WB status polling failed after retries")
 
-def wait_done(task_id: str):
+def wait_done_or_recreate(task_id: str, d_from: dt.date, d_to: dt.date, max_new_seconds: int = 180) -> str:
+    """
+    Ждём готовности задачи. Если слишком долго висит в status=new — пересоздаём задачу.
+    Возвращает итоговый task_id, у которого статус стал done.
+    """
     start = time.time()
     last_print = 0
+    current_task = task_id
+
     while True:
-        s = task_status(task_id)
+        s = task_status(current_task)
         now = time.time()
+
         if s == "done":
-            return
+            return current_task
         if s in ("error", "failed"):
-            raise RuntimeError(f"Task {task_id} failed: {s}")
-        if now - start > TIMEOUT_SECONDS:
-            raise TimeoutError(f"Task {task_id} timeout (> {TIMEOUT_SECONDS}s)")
+            raise RuntimeError(f"Task {current_task} failed: {s}")
+
+        # слишком долго в очереди — пересоздаём
+        if s == "new" and (now - start) > max_new_seconds:
+            print(f"status=new > {max_new_seconds}s, recreate WB task for {d_from}..{d_to}")
+            # мягкая пауза перед новым созданием
+            time.sleep(2)
+            current_task = create_task(d_from, d_to)
+            start = time.time()
+            last_print = 0
+            # небольшой лаг перед первым опросом нового task
+            time.sleep(2)
+            continue
+
         if now - last_print > 60:
-            print(f"waiting WB task {task_id}, status={s}, elapsed={int(now-start)}s")
+            print(f"waiting WB task {current_task}, status={s}, elapsed={int(now-start)}s")
             last_print = now
         time.sleep(POLL_EVERY_SECONDS)
 
@@ -146,13 +164,18 @@ def upsert(rows: List[Dict[str, Any]]):
 
 def fetch_window(d_from: dt.date, d_to: dt.date):
     task_id = create_task(d_from, d_to)
-    time.sleep(2)  # небольшой лаг перед опросом
-    wait_done(task_id)
+    # небольшой лаг перед первым опросом
+    time.sleep(2)
+    # ждём готовности; если застрянет в new — функция сама пересоздаст задачу
+    task_id = wait_done_or_recreate(task_id, d_from, d_to, max_new_seconds=180)
+
     data = download_report(task_id)
     print(f"rows downloaded: {len(data)} for {d_from}..{d_to}")
     rows = [normalize_row(r, task_id) for r in data]
     upsert(rows)
-    time.sleep(65)  # пауза чтобы не ловить 429 на следующем окне
+
+    # пауза, чтобы не поймать 429 на следующем окне
+    time.sleep(65)
 
 # === Режимы ===
 def backfill(year: int):
@@ -208,3 +231,4 @@ if __name__ == "__main__":
     else:
         print("Unknown mode")
         sys.exit(1)
+
