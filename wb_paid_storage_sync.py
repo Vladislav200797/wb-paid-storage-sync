@@ -21,7 +21,7 @@ HEADERS = {
 # Параметры
 MAX_DAYS = 8
 BATCH_SIZE = 1000
-REQ_TIMEOUT = 61
+REQ_TIMEOUT = 60
 STATUS_MAX_WAIT = int(os.getenv("WB_STATUS_MAX_WAIT", "900"))
 STATUS_POLL_STEP_MIN = 5
 STATUS_POLL_STEP_MAX = 20
@@ -271,4 +271,5 @@ if __name__ == "__main__":
         missing_env = str(ke).strip("'")
         print(f"Missing required environment variable: {missing_env}")
         sys.exit(2)
+
 
