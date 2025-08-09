@@ -3,11 +3,18 @@ from typing import List, Dict, Any
 import requests
 from supabase import create_client
 
-# === Конфиг через переменные окружения ===
-WB_BASE   = os.getenv("WB_API_BASE", "https://seller-analytics-api.wildberries.ru")
-WB_TOKEN  = os.environ["WB_API_TOKEN"]
-SB_URL    = os.environ["SUPABASE_URL"]
-SB_KEY    = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+WB_BASE = os.getenv("WB_API_BASE", "https://seller-analytics-api.wildberries.ru")
+WB_TOKEN = (os.getenv("WB_API_TOKEN") or os.getenv("WB_API_KEY") or "").strip()
+SB_URL = os.environ["SUPABASE_URL"].strip()
+SB_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"].strip()
+
+def _auth_header(bearer: bool = True):
+    tok = WB_TOKEN
+    return {
+        "Authorization": (f"Bearer {tok}" if bearer else tok),
+        "Accept": "application/json",
+    }
+
 
 HEADERS = { "Authorization": f"Bearer {WB_TOKEN}", "Accept": "application/json" }
 
@@ -207,4 +214,5 @@ if __name__ == "__main__":
     else:
         print("Unknown mode")
         sys.exit(1)
+
 
