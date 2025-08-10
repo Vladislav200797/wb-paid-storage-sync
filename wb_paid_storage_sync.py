@@ -266,7 +266,9 @@ if __name__ == "__main__":
     try:
         sys.exit(main(sys.argv))
     except KeyError as ke:
-        print(f"Missing required environment variable: {str(ke).strip(\"'\")}")
+        # Никаких backslash внутри f-string выражения
+        missing = str(ke).strip("'")
+        print(f"Missing required environment variable: {missing}")
         sys.exit(1)
     except Exception as e:
         # на всякий — не роняем job, чтобы расписание продолжало работать
