@@ -8,8 +8,8 @@ on:
         required: false
         default: "8"
   schedule:
-    # каждые 15 минут; можешь сократить/увеличить
-    - cron: "*/15 * * * *"
+  - cron: "0 3 * * *"
+
 
 concurrency:
   group: wb-paid-storage-sync
