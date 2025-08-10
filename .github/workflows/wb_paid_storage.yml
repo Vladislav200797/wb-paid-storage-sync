@@ -1,45 +1,39 @@
-name: WB Paid Storage Daily Sync
+name: run
 
 on:
+  workflow_dispatch:
   schedule:
-    # Ежедневно 07:05 по Amsterdam (UTC+2 летом → 05:05 UTC)
-    - cron: '5 5 * * *'
-  workflow_dispatch: {}
+    - cron: "*/5 * * * *"   # каждые 5 минут автозапуск
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 60  # (опционально) общий таймаут для job
-
+    timeout-minutes: 6      # джоба максимум 6 минут и завершится
+    env:
+      WB_API_BASE: https://seller-analytics-api.wildberries.ru
+      WB_STATUS_INTERVAL_SEC: "60"   # опрос раз в 60с
+      WB_STATUS_MAX_WAIT_SEC: "120"  # ждём всего 2 минуты и ВЫХОДИМ БЕЗ ОШИБКИ
+      WB_API_TOKEN: ${{ secrets.WB_API_TOKEN }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
     steps:
       - uses: actions/checkout@v4
 
-      # (опц.) проверка, что секреты реально подтянулись
-      - name: Debug env
+      - name: Quick sanity
         run: |
-          python - << 'PY'
+          python - <<'PY'
           import os
           print("WB_TOKEN length:", len(os.environ.get("WB_API_TOKEN","")))
           print("SUPABASE_URL set:", bool(os.environ.get("SUPABASE_URL")))
           print("SERVICE_ROLE set:", bool(os.environ.get("SUPABASE_SERVICE_ROLE_KEY")))
           PY
-        env:
-          WB_API_TOKEN: ${{ secrets.WB_API_TOKEN }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install deps
         run: pip install requests supabase==2.6.0
 
-      - name: Daily sync (last 8 days)
-        env:
-          PYTHONUNBUFFERED: "1"  # чтобы логи печатались сразу
-          WB_API_TOKEN: ${{ secrets.WB_API_TOKEN }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      - name: Run sync (short wait)
         run: python wb_paid_storage_sync.py sync 8
-        timeout-minutes: 40  # таймаут именно этого шага
