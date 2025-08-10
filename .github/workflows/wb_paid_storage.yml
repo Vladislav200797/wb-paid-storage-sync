@@ -1,39 +1,56 @@
-name: run
+name: WB Paid Storage Sync
 
 on:
   workflow_dispatch:
+    inputs:
+      days_back:
+        description: "Сколько дней назад захватить (1..8)"
+        required: false
+        default: "8"
   schedule:
-    - cron: "*/5 * * * *"   # каждые 5 минут автозапуск
+    # каждые 15 минут; можешь сократить/увеличить
+    - cron: "*/15 * * * *"
+
+concurrency:
+  group: wb-paid-storage-sync
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 6      # джоба максимум 6 минут и завершится
-    env:
-      WB_API_BASE: https://seller-analytics-api.wildberries.ru
-      WB_STATUS_INTERVAL_SEC: "60"   # опрос раз в 60с
-      WB_STATUS_MAX_WAIT_SEC: "120"  # ждём всего 2 минуты и ВЫХОДИМ БЕЗ ОШИБКИ
-      WB_API_TOKEN: ${{ secrets.WB_API_TOKEN }}
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    timeout-minutes: 12
+
     steps:
       - uses: actions/checkout@v4
-
-      - name: Quick sanity
-        run: |
-          python - <<'PY'
-          import os
-          print("WB_TOKEN length:", len(os.environ.get("WB_API_TOKEN","")))
-          print("SUPABASE_URL set:", bool(os.environ.get("SUPABASE_URL")))
-          print("SERVICE_ROLE set:", bool(os.environ.get("SUPABASE_SERVICE_ROLE_KEY")))
-          PY
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install requests supabase==2.6.0
+        run: |
+          pip install --upgrade pip
+          pip install requests supabase==2.6.0
 
-      - name: Run sync (short wait)
-        run: python wb_paid_storage_sync.py sync 8
+      - name: Sanity check env
+        run: |
+          python - <<'PY'
+          import os
+          for k in ("WB_API_TOKEN","SUPABASE_URL","SUPABASE_SERVICE_ROLE_KEY"):
+              v=os.getenv(k)
+              print(f"{k} set: {bool(v)}")
+          PY
+        env:
+          WB_API_TOKEN: ${{ secrets.WB_API_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+      - name: Sync last N days (<=8)
+        env:
+          WB_API_TOKEN: ${{ secrets.WB_API_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # при ручном запуске можно переопределить
+          DAYS_BACK: ${{ inputs.days_back }}
+        run: |
+          python wb_paid_storage_sync.py sync "${DAYS_BACK:-8}"
