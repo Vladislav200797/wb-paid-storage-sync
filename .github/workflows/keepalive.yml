@@ -6,49 +6,17 @@ on:
     - cron: "0 7 * * 1"
   workflow_dispatch:
 
+# нужно, чтобы экшн мог сделать коммит в репозиторий
 permissions:
-  contents: write  # нужно, чтобы сделать коммит
+  contents: write
 
 jobs:
   keepalive:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      # Получаем дату последнего коммита
-      - name: Get last commit date (ISO)
-        id: last
-        run: |
-          echo "date=$(git log -1 --format=%cI || echo 1970-01-01T00:00:00Z)" >> $GITHUB_OUTPUT
-
-      # Если последнему коммиту >45 дней — делаем «пустой» коммит в файл .github/KEEPALIVE
-      - name: Touch keepalive file when needed
-        if: ${{ (fromJson('["now"]').join('') && ( ( ( ( (github.event_name == 'schedule') || (github.event_name == 'workflow_dispatch') ) && true ) ) ) ) }} # просто заглушка, условие ниже
-        run: |
-          python - <<'PY'
-          import datetime, os, subprocess
-          from dateutil import parser
-          last = parser.isoparse("${{ steps.last.outputs.date }}")
-          now = datetime.datetime.now(datetime.timezone.utc)
-          days = (now - last).days
-          if days >= 45:
-              os.makedirs(".github", exist_ok=True)
-              with open(".github/KEEPALIVE", "w", encoding="utf-8") as f:
-                  f.write(f"keepalive: {now.isoformat()}\n")
-              subprocess.check_call(["git", "config", "user.name", "github-actions[bot]"])
-              subprocess.check_call(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"])
-              subprocess.check_call(["git", "add", ".github/KEEPALIVE"])
-              subprocess.check_call(["git", "commit", "-m", "chore: keepalive commit"])
-              # push через GITHUB_TOKEN
-              subprocess.check_call(["git", "push", "origin", "HEAD:${GITHUB_REF##*/}"])
-          else:
-              print(f"No keepalive needed, last commit {days} days ago.")
-          PY
-        env:
-          GITHUB_REF: ${{ github.ref }}
-
-      # Более простой вариант без Python: готовый экшн
-      # - uses: gautamkrishnar/keepalive-workflow@v1
-      #   with:
-      #     commit_message: "chore: keepalive"
-      #     time_elapsed: 45
+      # Готовый экшн. Если с последнего коммита прошло >= 45 дней — сделает небольшой коммит.
+      - uses: gautamkrishnar/keepalive-workflow@v1
+        with:
+          commit_message: "chore: keepalive"
+          # через сколько дней без активности делать коммит
+          time_elapsed: 45
