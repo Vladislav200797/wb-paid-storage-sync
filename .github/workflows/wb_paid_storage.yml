@@ -3,13 +3,19 @@ name: WB Paid Storage Sync
 on:
   workflow_dispatch:
     inputs:
-      days_back:
-        description: "Сколько дней назад захватить (1..8)"
+      mode:
+        description: "day | range | backfill"
+        required: true
+        default: "day"
+      start:
+        description: "YYYY-MM-DD (для range/backfill) или день (для day)"
         required: false
-        default: "8"
+      end:
+        description: "YYYY-MM-DD (для range/backfill)"
+        required: false
   schedule:
-  - cron: "0 3 * * *"
-
+    # Ежедневно в 01:10 UTC (в Европе/Амстердам обычно ~03:10 при DST)
+    - cron: "10 1 * * *"
 
 concurrency:
   group: wb-paid-storage-sync
@@ -18,7 +24,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
@@ -29,28 +35,40 @@ jobs:
 
       - name: Install deps
         run: |
-          pip install --upgrade pip
-          pip install requests supabase==2.6.0
+          python -m pip install --upgrade pip
+          pip install requests supabase==2.6.0 python-dotenv
 
-      - name: Sanity check env
-        run: |
-          python - <<'PY'
-          import os
-          for k in ("WB_API_TOKEN","SUPABASE_URL","SUPABASE_SERVICE_ROLE_KEY"):
-              v=os.getenv(k)
-              print(f"{k} set: {bool(v)}")
-          PY
+      - name: Daily sync (yesterday, idempotent)
+        if: github.event_name == 'schedule'
         env:
           WB_API_TOKEN: ${{ secrets.WB_API_TOKEN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          WB_BACKFILL_COOLDOWN_SECONDS: "5"
+        run: |
+          # вчерашний день в UTC. Если хочешь по Москве/Амстердаму — скажи, подправим.
+          YEST=$(date -u -d "yesterday" +%F)
+          echo "Sync day $YEST"
+          python load_paid_storage.py day "$YEST"
 
-      - name: Sync last N days (<=8)
+      - name: Manual run
+        if: github.event_name == 'workflow_dispatch'
         env:
           WB_API_TOKEN: ${{ secrets.WB_API_TOKEN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          # при ручном запуске можно переопределить
-          DAYS_BACK: ${{ inputs.days_back }}
         run: |
-          python wb_paid_storage_sync.py sync "${DAYS_BACK:-8}"
+          MODE="${{ github.event.inputs.mode }}"
+          START="${{ github.event.inputs.start }}"
+          END="${{ github.event.inputs.end }}"
+          if [ "$MODE" = "day" ]; then
+            # если дата не указана — возьмём вчера
+            DAY="${START:-$(date -u -d "yesterday" +%F)}"
+            python load_paid_storage.py day "$DAY"
+          elif [ "$MODE" = "range" ]; then
+            python load_paid_storage.py range "$START" "$END"
+          elif [ "$MODE" = "backfill" ]; then
+            python load_paid_storage.py backfill "$START" "$END"
+          else
+            echo "Unknown mode: $MODE"; exit 1
+          fi
