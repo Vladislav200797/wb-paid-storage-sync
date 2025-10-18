@@ -1,6 +1,7 @@
 name: WB Paid Storage Sync
 
 on:
+  # ручной запуск из UI с теми же режимами
   workflow_dispatch:
     inputs:
       mode:
@@ -13,9 +14,10 @@ on:
       end:
         description: "YYYY-MM-DD (для range/backfill)"
         required: false
+  # автоматический запуск по расписанию (UTC!)
   schedule:
-    # Ежедневно в 01:10 UTC (в Европе/Амстердам обычно ~03:10 при DST)
-    - cron: "10 1 * * *"
+    # каждый день в 04:00 UTC (≈ 07:00 МСК)
+    - cron: "0 4 * * *"
 
 concurrency:
   group: wb-paid-storage-sync
@@ -38,19 +40,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests supabase==2.6.0 python-dotenv
 
-      - name: Daily sync (yesterday, idempotent)
+      # === Автоматический дневной прогон: последняя неделя ===
+      - name: Scheduled sync (last 7 days)
         if: github.event_name == 'schedule'
         env:
           WB_API_TOKEN: ${{ secrets.WB_API_TOKEN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          WB_BACKFILL_COOLDOWN_SECONDS: "5"
+          # пауза между окнами не нужна, т.к. range <= 8 дней (одно окно WB)
         run: |
-          # вчерашний день в UTC. Если хочешь по Москве/Амстердаму — скажи, подправим.
           YEST=$(date -u -d "yesterday" +%F)
-          echo "Sync day $YEST"
-          python load_paid_storage.py day "$YEST"
+          SEVEN_DAYS_AGO=$(date -u -d "7 days ago" +%F)
+          echo "Sync last 7 days: $SEVEN_DAYS_AGO..$YEST"
+          python load_paid_storage.py range "$SEVEN_DAYS_AGO" "$YEST"
 
+      # === Ручной запуск из UI с тремя режимами ===
       - name: Manual run
         if: github.event_name == 'workflow_dispatch'
         env:
@@ -61,13 +65,16 @@ jobs:
           MODE="${{ github.event.inputs.mode }}"
           START="${{ github.event.inputs.start }}"
           END="${{ github.event.inputs.end }}"
+
           if [ "$MODE" = "day" ]; then
-            # если дата не указана — возьмём вчера
             DAY="${START:-$(date -u -d "yesterday" +%F)}"
+            echo "Manual day: $DAY"
             python load_paid_storage.py day "$DAY"
           elif [ "$MODE" = "range" ]; then
+            echo "Manual range: $START..$END"
             python load_paid_storage.py range "$START" "$END"
           elif [ "$MODE" = "backfill" ]; then
+            echo "Manual backfill: $START..$END"
             python load_paid_storage.py backfill "$START" "$END"
           else
             echo "Unknown mode: $MODE"; exit 1
